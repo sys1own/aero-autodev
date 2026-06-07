@@ -43,6 +43,31 @@ _UNSAFE_PATTERNS = re.compile(
     r"numba\.jit|numba\.cuda|@jit|@cuda\.jit)", re.IGNORECASE,
 )
 
+# Rust-specific patterns for cold-path detection
+_RS_MEMORY_PATTERNS = re.compile(
+    r"(unsafe\s*\{|unsafe\s+fn|unsafe\s+impl"
+    r"|\*mut\s|\*const\s"
+    r"|ManuallyDrop|MaybeUninit|NonNull"
+    r"|std::alloc::|alloc::|dealloc|Layout::from_size_align"
+    r"|std::mem::transmute|std::mem::forget|mem::transmute|mem::forget"
+    r"|std::ptr::|ptr::null|ptr::write|ptr::read"
+    r"|Box::from_raw|Box::into_raw"
+    r"|Arc::from_raw|Rc::from_raw"
+    r"|Pin<|Unpin)",
+)
+
+_RS_THREADING_PATTERNS = re.compile(
+    r"(std::thread|thread::spawn|thread::JoinHandle"
+    r"|std::sync::|Mutex<|RwLock<|Arc<.*Mutex|Condvar|Barrier"
+    r"|tokio::|async_std::|futures::"
+    r"|rayon::|crossbeam::"
+    r"|async\s+fn|async\s+move|\.await)",
+)
+
+_RS_LIFETIME_PATTERNS = re.compile(
+    r"(<'[a-z]|&'[a-z]|where\s.*'[a-z]\s*:)",
+)
+
 
 @dataclass
 class ColdPathReason:
@@ -286,6 +311,85 @@ def analyze_routing(source_path: str,
 
 
 # ---------------------------------------------------------------------------
+# Rust routing analysis
+# ---------------------------------------------------------------------------
+
+def analyze_routing_rust(source_path: str) -> RoutingAnalysis:
+    """Analyze a Rust source file and determine routing for each function.
+
+    Marks functions with unsafe blocks, raw pointers, lifetime constraints,
+    threading primitives, or explicit memory management as cold pass-through.
+    Pure loop-heavy math/tensor functions remain hot.
+    """
+    from translator.code_profiler import _rs_extract_functions, RS_FUNC_DECL
+
+    abs_path = os.path.join(_ROOT, source_path) if not os.path.isabs(source_path) else source_path
+
+    with open(abs_path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    analysis = RoutingAnalysis(source_file=source_path)
+    functions = _rs_extract_functions(source)
+
+    for func in functions:
+        name = func["name"]
+        body = func["body"]
+        start_line = func["start_line"]
+
+        routing = FunctionRouting(name=name, lineno=start_line)
+
+        # Memory / unsafe detection
+        for m in _RS_MEMORY_PATTERNS.finditer(body):
+            routing.reasons.append(ColdPathReason(
+                category="rust_memory",
+                detail=f"Memory/unsafe pattern: {m.group(0)[:50]}",
+                lineno=start_line + body[:m.start()].count("\n"),
+            ))
+
+        # Threading detection
+        for m in _RS_THREADING_PATTERNS.finditer(body):
+            routing.reasons.append(ColdPathReason(
+                category="rust_threading",
+                detail=f"Threading/async pattern: {m.group(0)[:50]}",
+                lineno=start_line + body[:m.start()].count("\n"),
+            ))
+
+        # Lifetime constraint detection
+        # Check the full function signature (source around start_line)
+        sig_start = max(0, start_line - 1)
+        sig_end = min(len(source.split("\n")), start_line + 3)
+        sig_text = "\n".join(source.split("\n")[sig_start:sig_end])
+        for m in _RS_LIFETIME_PATTERNS.finditer(sig_text):
+            routing.reasons.append(ColdPathReason(
+                category="rust_lifetime",
+                detail=f"Lifetime constraint: {m.group(0)[:50]}",
+                lineno=start_line,
+            ))
+
+        if routing.reasons:
+            routing.is_cold_passthrough = True
+            analysis.cold_count += 1
+        else:
+            analysis.hot_count += 1
+
+        analysis.functions.append(routing)
+
+    return analysis
+
+
+# ---------------------------------------------------------------------------
+# Unified routing dispatcher
+# ---------------------------------------------------------------------------
+
+def analyze_routing_dispatch(source_path: str,
+                             external_modules: set[str] | None = None) -> RoutingAnalysis:
+    """Route to the correct analyzer based on file extension."""
+    if source_path.endswith(".rs"):
+        return analyze_routing_rust(source_path)
+    return analyze_routing(source_path, external_modules)
+
+
+# ---------------------------------------------------------------------------
 # Integration: filter function list for translation
 # ---------------------------------------------------------------------------
 
@@ -296,7 +400,7 @@ def filter_translatable(source_path: str,
 
     Returns ``(translatable_names, cold_routings)``.
     """
-    routing = analyze_routing(source_path, external_modules)
+    routing = analyze_routing_dispatch(source_path, external_modules)
     cold_map = {f.name: f for f in routing.functions if f.is_cold_passthrough}
 
     translatable = []

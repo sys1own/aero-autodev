@@ -19,7 +19,7 @@ from translator.aero_translator import translate_file, translated_to_recipe
 from translator.entropy_filter import check_entropy, detect_param_recycling
 from translator.diff_sandbox import SandboxInput, verify_translation
 from translator.ffi_generator import analyze_ffi, write_ffi_module
-from translator.cold_pass_router import analyze_routing, filter_translatable
+from translator.cold_pass_router import analyze_routing, analyze_routing_dispatch, filter_translatable
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def run_translation_pipeline(
 
     # Phase 0b: Cold-path routing — detect untranslatable patterns
     print("[pipeline] Phase 0b: Cold-path routing", flush=True)
-    routing = analyze_routing(abs_source)
+    routing = analyze_routing_dispatch(abs_source)
     cold_names = [f.name for f in routing.functions if f.is_cold_passthrough]
     if cold_names:
         pr.cold_passthrough_count = len(cold_names)
