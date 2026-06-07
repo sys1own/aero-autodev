@@ -536,138 +536,21 @@ def generate_rust_ffi_handle(function_name: str,
     """Generate a thread-safe Rust FFI handle for binding .aeroc bytecode
     back into a native Rust binary compilation flow.
 
-    The handle provides:
-    - ``extern "C"`` function declarations for AeroVM interop
-    - Thread-safe wrapper using ``std::sync::Mutex``
-    - Array value passing with proper lifetime management
-    - Automatic cleanup on drop
-
-    Returns the Rust source code for the FFI binding module.
+    Standardized: delegates to
+    :func:`translator.ffi_codegen.generate_single_handle` so that every Rust
+    FFI artefact in the project shares one ``extern "C"`` raw-pointer
+    implementation (thread-safe handle, zero-allocation call frame, host
+    alignment + lifetime preservation). The import is lazy so non-FFI uses of
+    this module do not require the Tree-Sitter toolchain.
     """
-    if param_types is None:
-        param_types = [("data", "*const f64"), ("len", "usize")]
+    from translator.ffi_codegen import generate_single_handle
 
-    safe_name = function_name.replace("::", "_").replace(".", "_")
-    params_extern = ", ".join(f"{n}: {t}" for n, t in param_types)
-    params_safe = ", ".join(
-        f"{n}: &[f64]" if "f64" in t and "*" in t else f"{n}: {t}"
-        for n, t in param_types
+    return generate_single_handle(
+        function_name=function_name,
+        aeroc_module=aeroc_module,
+        param_types=param_types,
+        return_type=return_type,
     )
-    call_args = ", ".join(
-        f"{n}.as_ptr()" if "f64" in t and "*" in t
-        else f"{n}.len()" if t == "usize" and any("*" in pt for _, pt in param_types)
-        else n
-        for n, t in param_types
-    )
-
-    return f'''//! Auto-generated FFI handle for AeroVM bytecode module: {aeroc_module}
-//!
-//! Binds the translated .aeroc bytecode back into the native Rust
-//! compilation flow with thread-safe access.
-
-use std::ffi::CString;
-use std::sync::{{Mutex, OnceLock}};
-
-/// Opaque handle to the loaded AeroVM bytecode module.
-struct AeroModuleHandle {{
-    module_path: CString,
-    loaded: bool,
-}}
-
-impl AeroModuleHandle {{
-    fn new(path: &str) -> Self {{
-        Self {{
-            module_path: CString::new(path).expect("invalid module path"),
-            loaded: false,
-        }}
-    }}
-
-    fn ensure_loaded(&mut self) {{
-        if !self.loaded {{
-            // Load the .aeroc bytecode module into the AeroVM runtime
-            // In production this calls into the AeroVM C API
-            self.loaded = true;
-        }}
-    }}
-}}
-
-impl Drop for AeroModuleHandle {{
-    fn drop(&mut self) {{
-        if self.loaded {{
-            // Release the AeroVM module handle — prevents memory leaks
-            self.loaded = false;
-        }}
-    }}
-}}
-
-/// Thread-safe global handle to the bytecode module.
-static MODULE: OnceLock<Mutex<AeroModuleHandle>> = OnceLock::new();
-
-fn get_module() -> &'static Mutex<AeroModuleHandle> {{
-    MODULE.get_or_init(|| {{
-        Mutex::new(AeroModuleHandle::new("{aeroc_module}"))
-    }})
-}}
-
-// ---- extern "C" declarations for AeroVM runtime linkage ----
-
-extern "C" {{
-    fn aero_vm_invoke(
-        module: *const std::ffi::c_char,
-        func: *const std::ffi::c_char,
-        {params_extern},
-        out: *mut f64,
-        out_len: usize,
-    ) -> i32;
-}}
-
-/// Thread-safe wrapper to invoke the translated hot-path function.
-///
-/// Passes array values to the AeroVM bytecode module and collects
-/// the execution returns without memory leaks.
-pub fn {safe_name}_invoke({params_safe}) -> Result<{return_type}, String> {{
-    let module = get_module();
-    let mut handle = module.lock().map_err(|e| format!("lock poisoned: {{e}}"))?;
-    handle.ensure_loaded();
-
-    let func_name = CString::new("{function_name}").unwrap();
-    let mut output = vec![0.0f64; 1024]; // pre-allocated output buffer
-
-    let status = unsafe {{
-        aero_vm_invoke(
-            handle.module_path.as_ptr(),
-            func_name.as_ptr(),
-            {call_args},
-            output.as_mut_ptr(),
-            output.len(),
-        )
-    }};
-
-    if status != 0 {{
-        return Err(format!("AeroVM invocation failed with status {{}}", status));
-    }}
-
-    // Trim output buffer to actual result length (signaled by trailing NaN)
-    let actual_len = output.iter()
-        .position(|v| v.is_nan())
-        .unwrap_or(output.len());
-    output.truncate(actual_len);
-
-    Ok(output)
-}}
-
-#[cfg(test)]
-mod tests {{
-    use super::*;
-
-    #[test]
-    fn test_{safe_name}_handle_creation() {{
-        let module = get_module();
-        let handle = module.lock().unwrap();
-        assert!(!handle.loaded, "module should not be loaded until first invoke");
-    }}
-}}
-'''
 
 
 def write_rust_ffi_handles(functions: list[dict],

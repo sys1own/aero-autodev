@@ -138,9 +138,46 @@ def push_git_checkpoint(reason, metrics):
         json.dump(metrics, f, indent=2)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--duration', type=int, default=300) 
+    parser = argparse.ArgumentParser(
+        description="Aero AutoDev — Evolution & Translation Orchestrator",
+    )
+    parser.add_argument('--duration', type=int, default=300)
+    parser.add_argument(
+        '--target', type=str, default=None,
+        help="Isolate and profile an external target repository side-by-side",
+    )
+    parser.add_argument(
+        '--execute-translation-swap', action='store_true',
+        help="Trigger the deterministic AST-clamped code refactor pass against --target",
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help="Profile target AST structures and emit blueprint.aero without modifying disk",
+    )
+    parser.add_argument(
+        '--module', type=str, default='anyon_sim.aeroc',
+        help="Name of the .aeroc bytecode module for the FFI swap",
+    )
+    parser.add_argument(
+        '--blueprint', type=str, default=None,
+        help="Path for the emitted blueprint.aero (default: repo root)",
+    )
     args, unknown = parser.parse_known_args()
+
+    # --- Targeted translation pipeline -------------------------------------
+    # When a target is supplied, route into the AST-clamped translation-swap
+    # engine instead of the evolution loop. The loop's internal state tracking
+    # is left entirely untouched in this path.
+    if args.target:
+        from compile_production_swap import dispatch_target_pipeline
+        rc = dispatch_target_pipeline(
+            args.target,
+            dry_run=args.dry_run,
+            execute_swap=args.execute_translation_swap,
+            aeroc_module=args.module,
+            blueprint_path=args.blueprint,
+        )
+        sys.exit(rc)
 
     print("🚀 Initializing Grid-Hardened Swarm Evolution Engine...", flush=True)
     generate_swarm_environment()
