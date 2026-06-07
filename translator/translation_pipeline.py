@@ -18,6 +18,8 @@ sys.path.insert(0, _ROOT)
 from translator.aero_translator import translate_file, translated_to_recipe
 from translator.entropy_filter import check_entropy, detect_param_recycling
 from translator.diff_sandbox import SandboxInput, verify_translation
+from translator.ffi_generator import analyze_ffi, write_ffi_module
+from translator.cold_pass_router import analyze_routing, filter_translatable
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,9 @@ class PipelineResult:
     functions_rejected: int = 0
     entropy_blocked: int = 0
     recipes_written: int = 0
+    ffi_wrappers_generated: int = 0
+    cold_passthrough_count: int = 0
+    cold_passthrough_functions: list[str] = field(default_factory=list)
     details: list[dict] = field(default_factory=list)
 
 
@@ -79,9 +84,58 @@ def run_translation_pipeline(
 
     pr = PipelineResult(source_file=source_path)
 
-    # Phase 1: Translate
-    print(f"\n[pipeline] Phase 1: Translating {abs_source}", flush=True)
-    tr = translate_file(abs_source, function_names)
+    # Phase 0a: FFI analysis — detect external imports
+    print(f"\n[pipeline] Phase 0a: FFI analysis for {abs_source}", flush=True)
+    ffi = analyze_ffi(abs_source)
+    if ffi.external_imports:
+        ext_names = [i.module for i in ffi.external_imports]
+        print(f"[pipeline]   External imports detected: {', '.join(ext_names)}", flush=True)
+        if ffi.ffi_wrappers:
+            ffi_path = write_ffi_module(ffi)
+            pr.ffi_wrappers_generated = len(ffi.ffi_wrappers)
+            print(f"[pipeline]   Generated {pr.ffi_wrappers_generated} FFI wrapper(s) -> {ffi_path}", flush=True)
+            pr.details.append({
+                "phase": "ffi",
+                "external_imports": ext_names,
+                "wrappers": [w.wrapper_name for w in ffi.ffi_wrappers],
+                "ffi_module": ffi_path,
+            })
+    else:
+        print("[pipeline]   No external imports detected", flush=True)
+
+    # Phase 0b: Cold-path routing — detect untranslatable patterns
+    print("[pipeline] Phase 0b: Cold-path routing", flush=True)
+    routing = analyze_routing(abs_source)
+    cold_names = [f.name for f in routing.functions if f.is_cold_passthrough]
+    if cold_names:
+        pr.cold_passthrough_count = len(cold_names)
+        pr.cold_passthrough_functions = cold_names
+        print(f"[pipeline]   Cold pass-through ({pr.cold_passthrough_count}): {', '.join(cold_names)}", flush=True)
+        for f in routing.functions:
+            if f.is_cold_passthrough:
+                reasons = "; ".join(r.detail for r in f.reasons)
+                print(f"[pipeline]     {f.name}: {reasons}", flush=True)
+        pr.details.append({
+            "phase": "cold_routing",
+            "cold_functions": cold_names,
+            "reasons": {f.name: [r.detail for r in f.reasons]
+                        for f in routing.functions if f.is_cold_passthrough},
+        })
+    else:
+        print("[pipeline]   No cold pass-through functions detected", flush=True)
+
+    # Filter out cold-path functions before translation
+    if function_names is not None:
+        active_names = [n for n in function_names if n not in cold_names]
+    else:
+        active_names = None  # translate_file discovers; we filter after
+
+    # Phase 1: Translate (only non-cold functions)
+    print(f"[pipeline] Phase 1: Translating {abs_source}", flush=True)
+    tr = translate_file(abs_source, active_names)
+
+    # Post-filter: remove any cold functions that slipped through discovery
+    tr.functions = [tf for tf in tr.functions if tf.name not in cold_names]
     pr.functions_attempted = len(tr.functions)
 
     translatable = [tf for tf in tr.functions if tf.translatable]
