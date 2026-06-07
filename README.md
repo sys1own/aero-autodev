@@ -1,7 +1,3 @@
-Here is a clean, production-ready `README.md` file tailored specifically to your newly optimized framework layout. It highlights the core architectural breakthroughs—like bidirectional configuration matching and semantic filtering gates—making it perfect to show off to other developers or push straight to GitHub.
-
----
-
 ```markdown
 # Aero AutoDev
 
