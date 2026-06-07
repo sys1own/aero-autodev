@@ -7,7 +7,7 @@ codebase:
 2. Parse ``src/lib.rs`` into a Tree-Sitter syntax tree and isolate hot
    calculation pathways by their AST ``function_item`` node boundaries.
 3. Deactivate each hot path in place (``/* ... */`` clamped strictly to the
-   node's byte coordinates) and inject a standardized ``extern "C"`` FFI hook.
+   node's byte coordinates) and inject a standardized ``unsafe extern "C"`` FFI hook.
 4. Compile the modified project and run differential verification.
 5. Persist only if outputs match legacy behaviour bit-for-bit; otherwise roll
    back automatically.
