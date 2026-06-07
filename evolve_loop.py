@@ -1,248 +1,351 @@
-import os
-import sys
-import time
+"""Aero AutoDev — Deterministic Inventory Completion orchestrator.
+
+Replaces the legacy time-locked evolution loop with a workload-bounded driver.
+The execution model is:
+
+  1. AST discovery: parse the targeted external repository with the Tree-Sitter
+     frontend and index every eligible hot-path / math calculation candidate.
+     The total is bound once to the global ``Total_Target_Count``.
+  2. Stateful inventory tracking: an in-memory manifest records the convergence
+     state of every target block.
+  3. Convergence loop: each target is refactored, verified through the
+     differential bit-level sandbox, and (on success) its native stack-allocated
+     Aero FFI handle is committed to disk and the node is marked
+     'Successfully Converged'.
+  4. Deterministic termination: there are NO duration / clock / countdown
+     conditions. The loop terminates the instant
+     ``Converged_Target_Count == Total_Target_Count``.
+  5. Stagnation escape: a per-target patience ceiling of 5,000 validation
+     attempts bounds each block; idle spinning is prevented by escaping early
+     when a block stalls with no fitness advancement.
+"""
+
 import argparse
 import json
-import random
-import contextlib
+import os
+import sys
+from dataclasses import dataclass
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-from meta_compiler import compile_recipe
+sys.path.insert(0, _HERE)
 
-def generate_swarm_environment():
-    """Initializes the absolute directory matrix instantly at boot to resolve silent I/O compiler rejections"""
-    os.makedirs(os.path.join(_HERE, "aero_mesh_core", "swarm_blueprints"), exist_ok=True)
-    os.makedirs(os.path.join(_HERE, "aero_mesh_core", "dist"), exist_ok=True)
-    os.makedirs(os.path.join(_HERE, "build_sandbox", "recipes"), exist_ok=True)
-    os.makedirs(os.path.join(_HERE, "build_sandbox", "mesh_outputs"), exist_ok=True)
-    os.makedirs(os.path.join(_HERE, "testbed", "scans"), exist_ok=True)
+from compile_production_swap import (
+    ingest_target,
+    parse_and_identify,
+    generate_swapped_source,
+    differential_verify,
+    persist_swap,
+    compile_project,
+    serialize_swap_blueprint,
+)
+from translator import ffi_codegen
 
-def ensure_swarm_blueprints(force_reset=False):
-    """Guarantees that all three distinct architectural meshes are present on disk and structurally pristine"""
-    blueprints = {
-        "ingress_mesh.txt": (
-            "[project]\nname = ingress_mesh\noutput = build_sandbox/recipes/ingress_mesh.aeroc\n\n"
-            "[task:init]\nop = print\ntext = \"-- Initializing Ingress Nodes --\"\n\n"
-            "[task:ingest]\nop = print\ntext = \"-- sentinel | Ingesting Raw Telemetry Data Stream from testbed/scans/raw_telemetry_0 --\"\nneeds = init\n"
-        ),
-        "processing_mesh.txt": (
-            "[project]\nname = processing_mesh\noutput = build_sandbox/recipes/processing_mesh.aeroc\n\n"
-            "[task:compute]\nop = print\ntext = \"-- Processing Parallel Computations --\"\n\n"
-            "[task:transform]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/dist/interim.tmp\", \"processed\"\nneeds = compute\n"
-        ),
-        "aggregation_mesh.txt": (
-            "[project]\nname = aggregation_mesh\noutput = build_sandbox/recipes/aggregation_mesh.aeroc\n\n"
-            "[task:consolidate]\nop = print\ntext = \"-- Aggregating Distributed State --\"\n\n"
-            "[task:freeze]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/dist/index_manifest.txt\", \"state complete\"\nneeds = consolidate\n"
+# Patience ceiling: the absolute maximum number of continuous validation
+# attempts per target block before the stagnation-escape locks the block's
+# highest stable state and advances the queue.
+_PATIENCE_CEILING = 5000
+
+# Global inventory counters. ``Total_Target_Count`` is bound exactly once during
+# the AST discovery phase and treated as immutable thereafter.
+Total_Target_Count = 0
+Converged_Target_Count = 0
+
+
+@dataclass
+class TargetRecord:
+    """Inventory tracking entry for a single hot-path target block."""
+    name: str
+    score: float
+    lines: str
+    hook: str = ""
+    attempts: int = 0
+    converged: bool = False
+    processed: bool = False
+    stable_state: str = "original"
+    note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: AST discovery
+# ---------------------------------------------------------------------------
+
+def discover_inventory(lib_rs_path: str):
+    """Parse the target via the AST frontend and index hot-path candidates.
+
+    Returns ``(hot_paths, cold_names)`` exactly as the AST-clamped engine sees
+    them, so discovery and convergence operate on identical node boundaries.
+    """
+    return parse_and_identify(lib_rs_path)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: per-target convergence (bounded by the patience ceiling)
+# ---------------------------------------------------------------------------
+
+def _failure_signature(swapped_out: str) -> str:
+    """Stable signature of a failed validation, used for stagnation detection.
+
+    A deterministic transform yields an identical signature across attempts, so
+    a repeated signature proves no fitness advancement is possible.
+    """
+    text = swapped_out or ""
+    lowered = text.lower()
+    if "compilation failed" in lowered or "error[" in lowered or "error:" in lowered:
+        for line in text.splitlines():
+            if "error" in line.lower():
+                return f"compile:{line.strip()[:80]}"
+        return "compile:unknown"
+    return "diff_mismatch"
+
+
+def converge_target(abs_target: str,
+                    original_source: str,
+                    converged_hotpaths: list,
+                    hp,
+                    aeroc_module: str,
+                    record: TargetRecord) -> bool:
+    """Attempt to converge a single target block within the patience ceiling.
+
+    Each attempt regenerates the cumulative AST-clamped swap (already-converged
+    blocks plus this candidate), verifies it in the differential sandbox, and on
+    success commits the FFI handle to disk. Because the swap is deterministic,
+    the idle-prevention guard escapes the moment a block stalls; the
+    ``_PATIENCE_CEILING`` remains the hard upper bound on attempts.
+    """
+    candidate = converged_hotpaths + [hp]
+    last_signature = None
+
+    while record.attempts < _PATIENCE_CEILING:
+        record.attempts += 1
+
+        modified_lib, legacy_mod, ffi_mod = generate_swapped_source(
+            original_source, candidate, aeroc_module,
         )
+        passed, _legacy_out, swapped_out = differential_verify(
+            abs_target, modified_lib, legacy_mod, ffi_mod,
+        )
+
+        if passed:
+            # Safely commit the native stack-allocated Aero FFI handle to disk.
+            for action in persist_swap(abs_target, modified_lib, legacy_mod,
+                                       ffi_mod, candidate, aeroc_module):
+                print(f"    {action}")
+            return True
+
+        signature = _failure_signature(swapped_out)
+        record.note = signature
+
+        if signature == last_signature:
+            # No fitness advancement between attempts — deterministic stall.
+            print(f"    [idle-prevention] attempt {record.attempts}: no fitness "
+                  f"advancement; escaping (patience ceiling {_PATIENCE_CEILING}).")
+            break
+        last_signature = signature
+        print(f"    [retry] attempt {record.attempts} failed: {signature}")
+
+    if record.attempts >= _PATIENCE_CEILING:
+        print(f"    [patience-exhausted] {record.attempts} attempts reached the "
+              f"ceiling {_PATIENCE_CEILING}.")
+
+    record.stable_state = f"held@{len(converged_hotpaths)}_converged"
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 + 3 + 4: inventory completion loop
+# ---------------------------------------------------------------------------
+
+def run_inventory_completion(target_dir: str,
+                             aeroc_module: str = "anyon_sim.aeroc") -> int:
+    """Drive the deterministic inventory-completion loop to termination."""
+    global Total_Target_Count, Converged_Target_Count
+
+    abs_target = ingest_target(target_dir)
+    lib_rs = os.path.join(abs_target, "src", "lib.rs")
+    with open(lib_rs, "r", encoding="utf-8") as f:
+        original_source = f.read()
+
+    # --- Phase 1: AST discovery ---
+    hot_paths, cold_names = discover_inventory(lib_rs)
+    Total_Target_Count = len(hot_paths)
+    Converged_Target_Count = 0
+    print(f"\n[inventory] AST discovery complete — Total_Target_Count = {Total_Target_Count}")
+
+    if Total_Target_Count == 0:
+        print("[inventory] No eligible hot-path candidates; inventory already complete.")
+        return 0
+
+    # --- Phase 2: stateful inventory tracking matrix ---
+    nodes = ffi_codegen.assign_nodes([hp.fn for hp in hot_paths])
+    hook_by_name = {n.fn.name: n.hook for n in nodes}
+    manifest: dict[str, TargetRecord] = {
+        hp.name: TargetRecord(
+            name=hp.name,
+            score=hp.score,
+            lines=f"{hp.start_line}-{hp.end_line}",
+            hook=hook_by_name.get(hp.name, ""),
+        )
+        for hp in hot_paths
     }
-    
-    bp_dir = os.path.join(_HERE, "aero_mesh_core", "swarm_blueprints")
-    for name, content in blueprints.items():
-        path = os.path.join(bp_dir, name)
-        if force_reset or not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
 
-def execute_complexity_mutation(recipe_text, mesh_name, round_counter):
-    """Generates mutations tracking category limits safely via inline string literals"""
-    lines = recipe_text.split("\n")
-    tasks = []
-    
-    for line in lines:
-        if line.strip().startswith("[task:"):
-            tasks.append(line.split("[task:")[1].split("]")[0].strip())
+    converged_hotpaths: list = []
 
-    strategy = random.choice(["expand_nodes", "relink_dependencies", "fuzz_logs"])
-    
-    # RAILING 1: Absolute high-density structure ceiling limited to 25 nodes max per file
-    if len(tasks) >= 25 and strategy == "expand_nodes":
-        strategy = "relink_dependencies"
+    # --- Phase 3 + 4: convergence loop bounded by inventory completion ---
+    for hp in hot_paths:
+        record = manifest[hp.name]
+        print(f"\n[converge] Target '{hp.name}' (score {hp.score:.1f}) -> {record.hook}")
 
-    if strategy == "expand_nodes" and tasks:
-        cluster_tier = round_counter % 5000  
-        
-        if "ingress" in mesh_name:
-            pool = [
-                {"family": "sentinel", "op": "print", "body": f'text = "-- sentinel | Gateway Security Auth Check Sequence: Tier {cluster_tier} Key {round_counter} --"', "label": "Security Boundary"},
-                {"family": "balancer", "op": "print", "body": f'text = "-- balancer | Traffic Pool Load Balancing Routine Cluster Shard {cluster_tier} Frame {round_counter} --"', "label": "Stream Load Balancer"},
-                {"family": "buffer", "op": "call", "body": f'fn = write_file\nargs = "build_sandbox/mesh_outputs/buffer_ingress_stream_{round_counter}.dat", "stream"', "label": "Ingestion I/O Flush"}
-            ]
-        elif "processing" in mesh_name:
-            pool = [
-                {"family": "optimizer", "op": "print", "body": f'text = "-- optimizer | Optimization Engine State Synchronized: Segment {cluster_tier} Step {round_counter} --"', "label": "DAG Index Step"},
-                {"family": "memory", "op": "print", "body": f'text = "-- memory | Interlock Memory Latch Set: Range {cluster_tier} Frame {round_counter} --"', "label": "Shared Memory Link"},
-                {"family": "solver", "op": "call", "body": f'fn = write_file\nargs = "build_sandbox/mesh_outputs/matrix_block_{round_counter}.tmp", "bin"\nfamily = solver', "label": "Matrix solver farm Flush"}
-            ]
+        if converge_target(abs_target, original_source, converged_hotpaths,
+                           hp, aeroc_module, record):
+            converged_hotpaths.append(hp)
+            record.converged = True
+            record.processed = True
+            record.stable_state = f"ffi:{record.hook}"
+            Converged_Target_Count += 1
+            print(f"[converge] '{hp.name}' Successfully Converged "
+                  f"({Converged_Target_Count}/{Total_Target_Count})")
         else:
-            pool = [
-                {"family": "signer", "op": "print", "body": f'text = "-- signer | Release Package Cryptographic Seal Generated: Block {cluster_tier} ID {round_counter} --"', "label": "Integrity Handshake"},
-                {"family": "boxer", "op": "print", "body": f'text = "-- boxer | Standalone Swarm Package Bundled: Node {cluster_tier} Archive {round_counter} --"', "label": "Unified Box Output Bundle"},
-                {"family": "mapper", "op": "call", "body": f'fn = write_file\nargs = "aero_mesh_core/dist/global_swarm_index_{round_counter}.idx", "sync"\nfamily = mapper', "label": "Index Map Row"}
-            ]
-            
-        chosen = random.choice(pool)
-        unique_marker = f"_{round_counter}"
-        
-        # RAILING 2: Absolute global family clamp. Max 5 instances per operational family per file.
-        if recipe_text.count(chosen['family']) >= 5 or unique_marker in recipe_text:
-            strategy = "relink_dependencies"
-        else:
-            new_node_id = f"node{round_counter}"
-            parent_dependency = tasks[-1] 
-            
-            node_block = (
-                f"\n\n[task:{new_node_id}]\n"
-                f"op = {chosen['op']}\n"
-                f"{chosen['body']}\n"
-                f"needs = {parent_dependency}\n"
-            )
-            return recipe_text + node_block, f"Chained Clean Segment [{chosen['label']}] -> Node: {new_node_id}"
+            record.processed = True
+            print(f"[stagnation] '{hp.name}' locked at stable state "
+                  f"'{record.stable_state}' after {record.attempts} attempt(s); "
+                  f"advancing queue.")
 
-    if strategy == "relink_dependencies" and len(tasks) > 2:
-        new_lines = []
-        mutated = False
-        current_task = None
-        for line in lines:
-            if line.strip().startswith("[task:"):
-                current_task = line.split("[task:")[1].split("]")[0].strip()
-            if "needs =" in line and random.random() > 0.7:
-                candidates = [t for t in tasks[:-1] if t != current_task]
-                if candidates:
-                    t_target = random.choice(candidates)
-                    new_lines.append(f"needs = {t_target}")
-                    mutated = True
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-        desc = "Reconfigured Dependency Routing Graph Pathing" if mutated else "Maintained Current Graph Equilibrium"
-        return "\n".join(new_lines), desc
+        # Hard deterministic termination.
+        if Converged_Target_Count == Total_Target_Count:
+            print(f"\n[terminate] Converged_Target_Count == Total_Target_Count "
+                  f"== {Total_Target_Count}. Inventory fully converged.")
+            break
 
-    new_lines = []
-    mutated = False
-    for line in lines:
-        if "text =" in line and "Cluster Pulse Sequence" in line and random.random() > 0.5:
-            new_lines.append(f'text = "-- Swarm Matrix Execution Cluster Pulse Sequence #{round_counter} Global Entry --"')
-            mutated = True
-        else:
-            new_lines.append(line)
-    desc = "Updated Cluster Heartbeat Frame Strings" if mutated else "Stabilized Current Code Matrix States"
-    return "\n".join(new_lines), desc
+    # Final integrity check on the persisted target.
+    if converged_hotpaths:
+        ok, _ = compile_project(abs_target)
+        print(f"[final] Persisted target compiles cleanly: {'YES' if ok else 'NO'}")
 
-def push_git_checkpoint(reason, metrics):
-    """Saves state telemetry metrics to disk locally across runner windows"""
-    dist_dir = os.path.join(_HERE, "aero_mesh_core", "dist")
-    os.makedirs(dist_dir, exist_ok=True)
-    with open(os.path.join(dist_dir, "swarm_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+    _write_telemetry(abs_target, manifest)
+    _print_summary(manifest)
+    return 0 if Converged_Target_Count == Total_Target_Count else 2
+
+
+# ---------------------------------------------------------------------------
+# Dry run: AST discovery + blueprint, no disk modification
+# ---------------------------------------------------------------------------
+
+def run_discovery_only(target_dir: str,
+                       aeroc_module: str = "anyon_sim.aeroc",
+                       blueprint_path: str | None = None) -> int:
+    """AST discovery phase only — emit blueprint.aero without modifying disk."""
+    global Total_Target_Count
+
+    abs_target = ingest_target(target_dir)
+    lib_rs = os.path.join(abs_target, "src", "lib.rs")
+    hot_paths, cold_names = discover_inventory(lib_rs)
+    Total_Target_Count = len(hot_paths)
+
+    blueprint = serialize_swap_blueprint(abs_target, hot_paths, cold_names, aeroc_module)
+    out_path = blueprint_path or os.path.join(_HERE, "blueprint.aero")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(blueprint)
+
+    nodes = ffi_codegen.assign_nodes([hp.fn for hp in hot_paths])
+    print(f"\n[discovery] Total_Target_Count = {Total_Target_Count}")
+    for hp, node in zip(hot_paths, nodes):
+        print(f"  - {hp.name} (score {hp.score:.1f}, lines {hp.start_line}-{hp.end_line}) "
+              f"-> aero_ffi::{node.hook}")
+    print(f"[discovery] Cold paths preserved: {cold_names}")
+    print(f"[discovery] Blueprint written (no disk modification): {out_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Telemetry & reporting
+# ---------------------------------------------------------------------------
+
+def _write_telemetry(abs_target: str, manifest: dict[str, TargetRecord]) -> None:
+    out_dir = os.path.join(_HERE, "build_sandbox")
+    os.makedirs(out_dir, exist_ok=True)
+    data = {
+        "target": abs_target,
+        "total_target_count": Total_Target_Count,
+        "converged_target_count": Converged_Target_Count,
+        "patience_ceiling": _PATIENCE_CEILING,
+        "targets": {
+            name: {
+                "score": rec.score,
+                "lines": rec.lines,
+                "hook": rec.hook,
+                "attempts": rec.attempts,
+                "converged": rec.converged,
+                "processed": rec.processed,
+                "stable_state": rec.stable_state,
+                "note": rec.note,
+            }
+            for name, rec in manifest.items()
+        },
+    }
+    path = os.path.join(out_dir, "inventory_manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"[telemetry] Inventory manifest written: {path}")
+
+
+def _print_summary(manifest: dict[str, TargetRecord]) -> None:
+    print("\n" + "=" * 70)
+    print(" INVENTORY COMPLETION SUMMARY")
+    print("=" * 70)
+    print(f"  Total_Target_Count:     {Total_Target_Count}")
+    print(f"  Converged_Target_Count: {Converged_Target_Count}")
+    for rec in manifest.values():
+        status = "CONVERGED" if rec.converged else "STAGNATED"
+        print(f"  [{status:9s}] {rec.name:28s} attempts={rec.attempts} "
+              f"hook={rec.hook or '-'}")
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Aero AutoDev — Evolution & Translation Orchestrator",
+        description="Aero AutoDev — Deterministic Inventory Completion orchestrator",
     )
-    parser.add_argument('--duration', type=int, default=300)
     parser.add_argument(
-        '--target', type=str, default=None,
-        help="Isolate and profile an external target repository side-by-side",
+        '--target', required=True,
+        help="External target repository to scan and converge (must contain src/lib.rs)",
     )
     parser.add_argument(
         '--execute-translation-swap', action='store_true',
-        help="Trigger the deterministic AST-clamped code refactor pass against --target",
+        help="Run the deterministic inventory-completion convergence loop",
     )
     parser.add_argument(
         '--dry-run', action='store_true',
-        help="Profile target AST structures and emit blueprint.aero without modifying disk",
+        help="AST discovery + blueprint.aero only; no disk modification",
     )
     parser.add_argument(
-        '--module', type=str, default='anyon_sim.aeroc',
+        '--module', default='anyon_sim.aeroc',
         help="Name of the .aeroc bytecode module for the FFI swap",
     )
     parser.add_argument(
-        '--blueprint', type=str, default=None,
+        '--blueprint', default=None,
         help="Path for the emitted blueprint.aero (default: repo root)",
     )
     args, unknown = parser.parse_known_args()
 
-    # --- Targeted translation pipeline -------------------------------------
-    # When a target is supplied, route into the AST-clamped translation-swap
-    # engine instead of the evolution loop. The loop's internal state tracking
-    # is left entirely untouched in this path.
-    if args.target:
-        from compile_production_swap import dispatch_target_pipeline
-        rc = dispatch_target_pipeline(
-            args.target,
-            dry_run=args.dry_run,
-            execute_swap=args.execute_translation_swap,
-            aeroc_module=args.module,
-            blueprint_path=args.blueprint,
-        )
-        sys.exit(rc)
+    print("=" * 70)
+    print(" Aero AutoDev — Deterministic Inventory Completion Engine")
+    print("=" * 70)
 
-    print("🚀 Initializing Grid-Hardened Swarm Evolution Engine...", flush=True)
-    generate_swarm_environment()
-    ensure_swarm_blueprints(force_reset=False)
-    
-    start_time = time.time()
-    last_git_time = time.time()
-    last_heartbeat_time = time.time()
-    
-    total_rounds = 0
-    champions_frozen = 0
-    
-    meshes = ["ingress_mesh.txt", "processing_mesh.txt", "aggregation_mesh.txt"]
-    fitness_history = {m: {"node_count": 2, "compiled_successfully": True} for m in meshes}
-    interval_stats = {"cycles": 0, "compilation_faults": 0, "champions_crowned": []}
+    if args.dry_run:
+        sys.exit(run_discovery_only(args.target, args.module, args.blueprint))
 
-    bp_dir = os.path.join(_HERE, "aero_mesh_core", "swarm_blueprints")
+    if args.execute_translation_swap:
+        sys.exit(run_inventory_completion(args.target, aeroc_module=args.module))
 
-    while (time.time() - start_time) < args.duration:
-        current_time = time.time()
-        elapsed = int(current_time - start_time)
-        total_rounds += 1
-        interval_stats["cycles"] += 1
-        
-        target_mesh = random.choice(meshes)
-        mesh_path = os.path.join(bp_dir, target_mesh)
-        
-        try:
-            with open(mesh_path, "r", encoding="utf-8") as f_read:
-                original_blueprint = f_read.read()
-            
-            mutated_blueprint, mutation_description = execute_complexity_mutation(original_blueprint, target_mesh, total_rounds)
-            with open(mesh_path, "w", encoding="utf-8") as f_write:
-                f_write.write(mutated_blueprint)
-                
-            with open(os.devnull, 'w') as fnull:
-                with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
-                    compile_recipe(mesh_path, run=True)
-            
-            mutated_nodes = mutated_blueprint.count("[task:")
-            if mutated_nodes > fitness_history[target_mesh]["node_count"]:
-                fitness_history[target_mesh]["node_count"] = mutated_nodes
-                champions_frozen += 1
-            elif mutated_blueprint != original_blueprint and mutated_nodes == fitness_history[target_mesh]["node_count"]:
-                pass
-            else:
-                with open(mesh_path, "w", encoding="utf-8") as f_revert:
-                    f_revert.write(original_blueprint)
-                    
-        except Exception:
-            interval_stats["compilation_faults"] += 1
-            with open(mesh_path, "w", encoding="utf-8") as f_revert:
-                f_revert.write(original_blueprint)
+    print("[info] No action flag supplied. Use --execute-translation-swap to converge")
+    print("[info] the inventory, or --dry-run for AST discovery + blueprint.")
+    print("[info] Defaulting to a safe dry-run.")
+    sys.exit(run_discovery_only(args.target, args.module, args.blueprint))
 
-        if (current_time - last_heartbeat_time) >= 10:
-            print(f"⏳ [SWARM STATE HEARTBEAT] Time: {elapsed}s | Velocity: {interval_stats['cycles']} cycles | Total Champs: {champions_frozen}", flush=True)
-            interval_stats = {"cycles": 0, "compilation_faults": 0, "champions_crowned": []}
-            last_heartbeat_time = current_time
-
-        if (current_time - last_git_time) >= 180:
-            last_git_time = current_time
-            push_git_checkpoint(f"Runtime: {elapsed}s", fitness_history)
-
-    push_git_checkpoint("Evolution run complete", fitness_history)
-    print("🏁 Operational timeline achieved cleanly.", flush=True)
 
 if __name__ == '__main__':
     main()
