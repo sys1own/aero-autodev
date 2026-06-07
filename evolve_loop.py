@@ -28,12 +28,12 @@ def ensure_swarm_blueprints(force_reset=False):
         "processing_mesh.txt": (
             "[project]\nname = processing_mesh\noutput = build_sandbox/recipes/processing_mesh.aeroc\n\n"
             "[task:compute]\nop = print\ntext = \"-- Processing Parallel Computations --\"\n\n"
-            "[task:transform]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/aero_mesh_core/dist/interim.tmp\", \"processed\"\nneeds = compute\n"
+            "[task:transform]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/dist/interim.tmp\", \"processed\"\nneeds = compute\n"
         ),
         "aggregation_mesh.txt": (
             "[project]\nname = aggregation_mesh\noutput = build_sandbox/recipes/aggregation_mesh.aeroc\n\n"
             "[task:consolidate]\nop = print\ntext = \"-- Aggregating Distributed State --\"\n\n"
-            "[task:freeze]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/aero_mesh_core/dist/index_manifest.txt\", \"state complete\"\nneeds = consolidate\n"
+            "[task:freeze]\nop = call\nfn = write_file\nargs = \"aero_mesh_core/dist/index_manifest.txt\", \"state complete\"\nneeds = consolidate\n"
         )
     }
     
@@ -72,13 +72,13 @@ def execute_complexity_mutation(recipe_text, mesh_name, round_counter):
             pool = [
                 {"family": "optimizer", "op": "print", "body": f'text = "-- optimizer | Optimization Engine State Synchronized: Segment {cluster_tier} Step {round_counter} --"', "label": "DAG Index Step"},
                 {"family": "memory", "op": "print", "body": f'text = "-- memory | Interlock Memory Latch Set: Range {cluster_tier} Frame {round_counter} --"', "label": "Shared Memory Link"},
-                {"family": "solver", "op": "call", "body": f'fn = write_file\nargs = "build_sandbox/mesh_outputs/matrix_block_{round_counter}.tmp", "bin"', "label": "Matrix solver farm Flush"}
+                {"family": "solver", "op": "call", "body": f'fn = write_file\nargs = "build_sandbox/mesh_outputs/matrix_block_{round_counter}.tmp", "bin"\nfamily = solver', "label": "Matrix solver farm Flush"}
             ]
         else:
             pool = [
                 {"family": "signer", "op": "print", "body": f'text = "-- signer | Release Package Cryptographic Seal Generated: Block {cluster_tier} ID {round_counter} --"', "label": "Integrity Handshake"},
                 {"family": "boxer", "op": "print", "body": f'text = "-- boxer | Standalone Swarm Package Bundled: Node {cluster_tier} Archive {round_counter} --"', "label": "Unified Box Output Bundle"},
-                {"family": "mapper", "op": "call", "body": f'fn = write_file\nargs = "aero_mesh_core/dist/global_swarm_index_{round_counter}.idx", "sync"', "label": "Index Map Row"}
+                {"family": "mapper", "op": "call", "body": f'fn = write_file\nargs = "aero_mesh_core/dist/global_swarm_index_{round_counter}.idx", "sync"\nfamily = mapper', "label": "Index Map Row"}
             ]
             
         chosen = random.choice(pool)
@@ -102,11 +102,18 @@ def execute_complexity_mutation(recipe_text, mesh_name, round_counter):
     if strategy == "relink_dependencies" and len(tasks) > 2:
         new_lines = []
         mutated = False
+        current_task = None
         for line in lines:
+            if line.strip().startswith("[task:"):
+                current_task = line.split("[task:")[1].split("]")[0].strip()
             if "needs =" in line and random.random() > 0.7:
-                t_target = random.choice(tasks[:-1])
-                new_lines.append(f"needs = {t_target}")
-                mutated = True
+                candidates = [t for t in tasks[:-1] if t != current_task]
+                if candidates:
+                    t_target = random.choice(candidates)
+                    new_lines.append(f"needs = {t_target}")
+                    mutated = True
+                else:
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
         desc = "Reconfigured Dependency Routing Graph Pathing" if mutated else "Maintained Current Graph Equilibrium"

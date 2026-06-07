@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime-generated directories (created by evolve_loop.py)
+aero_mesh_core/
+build_sandbox/
