@@ -18,12 +18,13 @@ from dataclasses import dataclass, field
 # Data structures
 # ---------------------------------------------------------------------------
 
-SUPPORTED_EXTENSIONS = {".py", ".js"}
+SUPPORTED_EXTENSIONS = {".py", ".js", ".rs"}
 
 COLD_PATH_INDICATORS = {
     "config_patterns": re.compile(
         r"(config|settings|\.env|constants|setup\.py|setup\.cfg"
-        r"|package\.json|tsconfig|\.eslintrc|webpack)", re.IGNORECASE,
+        r"|package\.json|tsconfig|\.eslintrc|webpack"
+        r"|Cargo\.toml|Cargo\.lock|build\.rs)", re.IGNORECASE,
     ),
     "ui_patterns": re.compile(
         r"(template|component|\.html|\.css|\.scss|render\s*\()", re.IGNORECASE,
@@ -273,6 +274,185 @@ def analyze_javascript(source: str, filepath: str) -> list[FunctionProfile]:
 
 
 # ---------------------------------------------------------------------------
+# Rust analyzer (regex-based tokenizer)
+# ---------------------------------------------------------------------------
+
+# Matches: fn name(args) -> RetType { ... }, pub fn, pub(crate) fn, async fn, etc.
+RS_FUNC_DECL = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)"
+)
+RS_STRUCT_DECL = re.compile(r"(?:pub(?:\s*\([^)]*\))?\s+)?struct\s+(\w+)")
+RS_IMPL_BLOCK = re.compile(r"impl(?:<[^>]*>)?\s+(\w+)")
+RS_LOOP = re.compile(r"\b(for|while|loop)\b")
+RS_FUNC_CALL = re.compile(r"\b(\w+)\s*\(")
+RS_ARRAY_OPS = re.compile(
+    r"\.(iter|into_iter|map|filter|fold|reduce|collect|for_each|flatten"
+    r"|flat_map|zip|enumerate|sum|product|any|all|find|position"
+    r"|sort|sort_by|sort_unstable|push|pop|extend|retain|drain"
+    r"|split|join|contains|starts_with|ends_with|replace|trim)\s*\(",
+)
+
+# Rust memory / lifetime / unsafe patterns for cold-path detection
+RS_LIFETIME_PATTERNS = re.compile(
+    r"(unsafe\s+\{|unsafe\s+fn|unsafe\s+impl"
+    r"|\*mut\s|\*const\s"
+    r"|ManuallyDrop|MaybeUninit|NonNull|Pin<"
+    r"|std::alloc::|alloc::|dealloc|Layout::from_size_align"
+    r"|std::mem::transmute|std::mem::forget|mem::transmute|mem::forget"
+    r"|std::ptr::|ptr::null|ptr::write|ptr::read"
+    r"|Box::from_raw|Box::into_raw"
+    r"|Arc::from_raw|Rc::from_raw)",
+)
+
+RS_THREADING_PATTERNS = re.compile(
+    r"(std::thread|thread::spawn|thread::JoinHandle"
+    r"|std::sync::|Mutex|RwLock|Arc<|Condvar|Barrier"
+    r"|tokio::|async_std::|futures::"
+    r"|rayon::|crossbeam::)",
+)
+
+# Hot-path math/tensor patterns in Rust
+RS_MATH_TENSOR_PATTERNS = re.compile(
+    r"(\bfor\b.*\bin\b.*\.\.|\bwhile\b"
+    r"|\[.*\].*\[.*\]"
+    r"|ndarray|nalgebra|tensor|matrix|eigen|lapack"
+    r"|f32|f64|usize|isize"
+    r"|\+=|\-=|\*=|/="
+    r"|\.sin\(|\.cos\(|\.exp\(|\.sqrt\(|\.abs\(|\.powi\(|\.powf\()",
+)
+
+
+def _rs_extract_functions(source: str) -> list[dict]:
+    """Extract function boundaries from Rust source using brace matching."""
+    functions = []
+    for m in RS_FUNC_DECL.finditer(source):
+        name = m.group(1)
+        start_pos = m.start()
+        start_line = source[:start_pos].count("\n") + 1
+
+        # Find opening brace
+        brace_pos = source.find("{", m.end())
+        if brace_pos == -1:
+            continue
+
+        # Match braces to find function end
+        depth = 1
+        pos = brace_pos + 1
+        while pos < len(source) and depth > 0:
+            ch = source[pos]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            pos += 1
+
+        end_line = source[:pos].count("\n") + 1
+        body = source[brace_pos:pos]
+
+        functions.append({
+            "name": name,
+            "start_line": start_line,
+            "end_line": end_line,
+            "body": body,
+        })
+
+    return functions
+
+
+def _rs_loop_depth(body: str) -> int:
+    """Estimate maximum loop nesting depth in a Rust function body."""
+    max_depth = 0
+    depth = 0
+    brace_depth = 0
+    loop_braces = []
+
+    lines = body.split("\n")
+    for line in lines:
+        stripped = line.strip()
+        if RS_LOOP.search(stripped):
+            # Find the next { after the loop keyword
+            loop_braces.append(brace_depth + stripped.count("{"))
+            depth += 1
+            if depth > max_depth:
+                max_depth = depth
+
+        for ch in stripped:
+            if ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+                if loop_braces and brace_depth < loop_braces[-1]:
+                    loop_braces.pop()
+                    depth = max(depth - 1, 0)
+
+    return max_depth
+
+
+def _rs_is_memory_cold(body: str) -> bool:
+    """Check if a Rust function contains memory/lifetime patterns."""
+    return bool(RS_LIFETIME_PATTERNS.search(body))
+
+
+def _rs_is_threading_cold(body: str) -> bool:
+    """Check if a Rust function contains threading/async patterns."""
+    return bool(RS_THREADING_PATTERNS.search(body))
+
+
+def _rs_is_math_hot(body: str) -> bool:
+    """Check if a Rust function contains math/tensor hot-path patterns."""
+    return bool(RS_MATH_TENSOR_PATTERNS.search(body))
+
+
+def analyze_rust(source: str, filepath: str) -> list[FunctionProfile]:
+    """Analyze a Rust source file for function calls, loops, and complexity."""
+    functions = _rs_extract_functions(source)
+    structs = RS_STRUCT_DECL.findall(source)
+
+    profiles = []
+    for func in functions:
+        name = func["name"]
+        body = func["body"]
+
+        loop_depth = _rs_loop_depth(body)
+        calls = RS_FUNC_CALL.findall(body)
+        calls = [c for c in calls if c not in ("for", "while", "loop", "if",
+                                                "match", "fn", "let", "mut",
+                                                "return", "struct", "impl",
+                                                "pub", "use", "mod")]
+        is_recursive = name in calls
+        arr_ops = len(RS_ARRAY_OPS.findall(body))
+
+        is_memory_cold = _rs_is_memory_cold(body)
+        is_threading_cold = _rs_is_threading_cold(body)
+        is_math_hot = _rs_is_math_hot(body)
+
+        span = func["end_line"] - func["start_line"] + 1
+        score = (
+            loop_depth * 3.0
+            + arr_ops * 1.5
+            + (5.0 if is_recursive else 0.0)
+            + len(calls) * 0.2
+            + span * 0.05
+            + (3.0 if is_math_hot else 0.0)
+            - (10.0 if is_memory_cold else 0.0)
+            - (10.0 if is_threading_cold else 0.0)
+        )
+
+        profiles.append(FunctionProfile(
+            name=name,
+            lineno=func["start_line"],
+            end_lineno=func["end_line"],
+            max_loop_depth=loop_depth,
+            is_recursive=is_recursive,
+            calls=calls[:20],
+            array_string_ops=arr_ops,
+            complexity_score=round(max(score, 0.0), 2),
+        ))
+
+    return profiles
+
+
+# ---------------------------------------------------------------------------
 # Directory traversal & profiling
 # ---------------------------------------------------------------------------
 
@@ -306,9 +486,12 @@ def profile_file(entry: dict, target_dir: str) -> FileProfile | None:
     except OSError:
         return None
 
-    lang = "python" if ext == ".py" else "javascript"
+    lang_map = {".py": "python", ".js": "javascript", ".rs": "rust"}
+    lang = lang_map.get(ext, "unknown")
     if lang == "python":
         functions = analyze_python(source, path)
+    elif lang == "rust":
+        functions = analyze_rust(source, path)
     else:
         functions = analyze_javascript(source, path)
 
